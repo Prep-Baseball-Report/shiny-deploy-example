@@ -1,0 +1,85 @@
+name: Deploy Draft League App to Amazon ECS
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - webapp/**
+      - infra/**
+    branches:
+      - main
+  pull_request:
+    paths:
+      - webapp/**
+      - infra/**
+
+env:
+  AWS_REGION: us-east-1
+  APP_NAME: draft-league-app             # set this to your app name
+  ECR_REPOSITORY: draft-league     # set this to your Amazon ECR repository name
+
+jobs:
+  deploy-draft-league-app:
+    name: Deploy Draft League App
+    runs-on: ubuntu-latest
+    env:
+      CLOUD_FORMATION_ROLE: arn:aws:iam::807324965916:role/cdk-hnb659fds-cfn-exec-role-807324965916-us-east-1
+
+    steps:
+    - name: Set Environment
+      id: setenv
+      run: |
+          echo "Running on branch ${{ github.ref }}"
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            echo "::set-output name=env_name::prod"
+          else
+             echo "::set-output name=env_name::dev"
+          fi
+    - name: ECS_TASK_DEFINITIONCheckout
+      uses: actions/checkout@v2
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v1
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+        role-to-assume: arn:aws:iam::807324965916:role/cdk-hnb659fds-deploy-role-807324965916-us-east-1
+        role-duration-seconds: 900
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v1
+    - name: Create New ECR if it doesn't exist
+      id: create-ecr
+      run: |
+        repo=${ECR_REPOSITORY}
+        # check the repo's existence by listing it out
+        # if it doesn't exist, create a new one using the directory name
+        aws ecr describe-repositories --repository-names ${repo} || aws ecr create-repository --repository-name ${repo}
+        echo "repo=$repo" >> $GITHUB_OUTPUT
+    - name: Install npm
+      run: 'sudo apt update -y && sudo apt install nodejs npm -y'
+    - name: Install AWS CDK
+      run: 'sudo npm install -g aws-cdk'
+    - name: Install Requirements
+      working-directory: infra
+      run: 'pip3 install -r requirements.txt'
+    - name: Build, tag, and push image to Amazon ECR
+      id: build-image
+      working-directory: webapp
+      env:
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        # Build a docker container and
+        # push it to ECR so that it can
+        # be deployed to ECS.
+        git_hash=$(git rev-parse --short "$GITHUB_SHA")
+        echo $git_hash
+        docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$git_hash-${{steps.setenv.outputs.env_name}} --build-arg build_env=${{steps.setenv.outputs.env_name}} .
+        docker push $ECR_REGISTRY/$ECR_REPOSITORY:$git_hash-${{steps.setenv.outputs.env_name}}
+        echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY:$git_hash-${{steps.setenv.outputs.env_name}}"
+    - name: Deploy Service
+      working-directory: infra
+      run: cdk deploy "*" -c app_name=$APP_NAME -c environment=${{steps.setenv.outputs.env_name}} -c image=${{ steps.build-image.outputs.image }} --require-approval never -r ${{env.CLOUD_FORMATION_ROLE}}
